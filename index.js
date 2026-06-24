@@ -1,150 +1,139 @@
-const express = require('express');
-const cors = require('cors');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const puppeteer = require('puppeteer');
+import express from 'express';
+import cors from 'cors';
+import { createRequire } from 'module';
+import { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import QRCode from 'qrcode';
+import { promises as fs } from 'fs';
+
+const require = createRequire(import.meta.url);
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-let client = null;
-let qrCode = null;
-let status = 'disconnected'; // 'disconnected' | 'connecting' | 'qr_ready' | 'connected'
-
 const API_KEY = process.env.API_KEY || 'your-secret-api-key';
+const SESSION_DIR = './auth_info';
+
+let sock = null;
+let status = 'disconnected'; // disconnected | connecting | qr_ready | connected
+let latestQR = null; // raw QR string from Baileys
+
+const logger = pino({ level: 'silent' }); // keep logs quiet
 
 function checkAuth(req, res, next) {
   const key = req.headers['x-api-key'];
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
 app.use(checkAuth);
 
-async function getChromePath() {
-  try {
-    // Use puppeteer's downloaded Chrome
-    const browser = await puppeteer.launch({ headless: true });
-    const path = browser.process().spawnfile;
-    await browser.close();
-    return path;
-  } catch (e) {
-    console.log('Could not detect puppeteer chrome path, using system defaults');
-    return null;
-  }
-}
-
-async function initWhatsApp() {
-  if (client) return;
+async function startSocket() {
+  if (sock) return;
   status = 'connecting';
-  console.log('[WhatsApp] Initializing...');
+  latestQR = null;
+  console.log('[WA] Starting Baileys socket...');
 
-  const chromePath = await getChromePath();
-  console.log('[WhatsApp] Chrome path:', chromePath || 'system default');
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const { version } = await fetchLatestBaileysVersion();
 
-  client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './whatsapp-session' }),
-    puppeteer: {
-      headless: true,
-      executablePath: chromePath || undefined,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--disable-extensions',
-      ],
-    },
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    printQRInTerminal: false,
+    browser: ['PrimeCash', 'Chrome', '120.0'],
   });
 
-  client.on('qr', (qr) => {
-    qrCode = qr;
-    status = 'qr_ready';
-    console.log('[WhatsApp] QR Code ready');
-  });
+  sock.ev.on('creds.update', saveCreds);
 
-  client.on('ready', () => {
-    status = 'connected';
-    qrCode = null;
-    console.log('[WhatsApp] Connected!');
-  });
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-  client.on('disconnected', () => {
-    status = 'disconnected';
-    client = null;
-    qrCode = null;
-    console.log('[WhatsApp] Disconnected.');
-  });
+    if (qr) {
+      latestQR = qr;
+      status = 'qr_ready';
+      console.log('[WA] QR ready — waiting for scan');
+    }
 
-  client.on('auth_failure', () => {
-    status = 'disconnected';
-    client = null;
-    console.error('[WhatsApp] Auth failed.');
-  });
+    if (connection === 'open') {
+      status = 'connected';
+      latestQR = null;
+      console.log('[WA] Connected!');
+    }
 
-  client.initialize().catch(err => {
-    console.error('[WhatsApp] Init error:', err.message);
-    status = 'disconnected';
-    client = null;
+    if (connection === 'close') {
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      console.log('[WA] Connection closed. Reason:', reason);
+      sock = null;
+      latestQR = null;
+
+      if (reason === DisconnectReason.loggedOut) {
+        // Session invalidated — clear auth and let user re-scan
+        status = 'disconnected';
+        try { await fs.rm(SESSION_DIR, { recursive: true, force: true }); } catch {}
+        console.log('[WA] Logged out — session cleared');
+      } else {
+        // Any other disconnect — reconnect automatically
+        status = 'connecting';
+        setTimeout(startSocket, 3000);
+      }
+    }
   });
 }
 
-function formatPhone(phone) {
-  let p = phone.replace(/[^0-9]/g, '');
-  if (p.startsWith('0')) p = '94' + p.substring(1);
-  else if (p.length === 9) p = '94' + p;
-  return `${p}@c.us`;
-}
+// Health check (no auth needed for uptime monitors)
+app.get('/health', (req, res) => res.json({ ok: true, status }));
 
-// Health check (no auth needed)
-app.get('/health', (req, res) => {
-  res.json({ ok: true, status });
-});
-
-app.get('/status', (req, res) => {
+app.get('/status', async (req, res) => {
   if (status === 'disconnected') {
-    initWhatsApp(); // fire and forget — QR arrives async
+    startSocket().catch(console.error);
   }
-  res.json({ status, qrCode });
+  // Convert QR string to a base64 PNG so the frontend can display it directly
+  let qrImage = null;
+  if (latestQR) {
+    try { qrImage = await QRCode.toDataURL(latestQR); } catch {}
+  }
+  res.json({ status, qrCode: latestQR, qrImage });
 });
 
 app.post('/disconnect', async (req, res) => {
-  if (client) {
-    try {
-      await client.logout();
-      await client.destroy();
-    } catch (e) {}
+  if (sock) {
+    try { await sock.logout(); } catch {}
+    sock = null;
   }
   status = 'disconnected';
-  qrCode = null;
-  client = null;
+  latestQR = null;
+  try { await fs.rm(SESSION_DIR, { recursive: true, force: true }); } catch {}
   res.json({ ok: true });
 });
 
 app.post('/send', async (req, res) => {
-  if (status !== 'connected' || !client) {
+  if (status !== 'connected' || !sock) {
     return res.status(400).json({ error: `WhatsApp not connected (status: ${status})` });
   }
   const { to, message } = req.body;
-  if (!to || !message) {
-    return res.status(400).json({ error: 'Missing to or message' });
-  }
+  if (!to || !message) return res.status(400).json({ error: 'Missing to or message' });
+
   try {
-    const formatted = formatPhone(to);
-    await client.sendMessage(formatted, message);
+    // Format Sri Lankan numbers: 07x → 94 7x
+    let phone = to.replace(/[^0-9]/g, '');
+    if (phone.startsWith('0')) phone = '94' + phone.substring(1);
+    else if (phone.length === 9) phone = '94' + phone;
+    const jid = `${phone}@s.whatsapp.net`;
+
+    await sock.sendMessage(jid, { text: message });
     res.json({ ok: true });
   } catch (err) {
-    console.error('[WhatsApp] Send error:', err.message);
+    console.error('[WA] Send error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`WhatsApp microservice running on port ${PORT}`);
-  // Auto-start on boot
-  initWhatsApp();
+  console.log(`WhatsApp microservice (Baileys) running on port ${PORT}`);
+  startSocket().catch(console.error);
 });
