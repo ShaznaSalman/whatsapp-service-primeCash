@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "node -e \"const { execSync } = require('child_process'); try { execSync('npx puppeteer browsers install chrome', { stdio: 'inherit' }); } catch(e) { console.log('Chrome install skipped:', e.message); }\""
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "puppeteer": "^22.0.0",
     "whatsapp-web.js": "^1.23.0",
     "qrcode": "^1.5.3"
   }
